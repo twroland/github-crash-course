@@ -1,0 +1,2 @@
+# Runtime dependencies go here, one per line, pinned (e.g. requests==2.32.4).
+# The sample app uses only the standard library.
