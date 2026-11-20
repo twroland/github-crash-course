@@ -1,1 +1,194 @@
+# =============================================================================
+# CI/CD template with security gates (Python project)
+#
+# Flow:
+#   PR or push ──► lint ─┐
+#                 test ──┼──► build (artifact + SBOM) ──► deploy-staging ──► deploy-production
+#                 sast ──┤      (main only)                (automatic)         (needs approval)
+#                 sca  ──┘
+#
+# Setup (one time):
+#   1. Put this file at .github/workflows/ci-cd.yml in your repository.
+#   2. Settings → Environments → create "staging" and "production".
+#      On "production", add Required reviewers  → this makes it Continuous DELIVERY.
+#      (Without reviewers, every green merge deploys = Continuous DEPLOYMENT.)
+#   3. Settings → Branches → protect "main": require a pull request, 1 approval,
+#      and the status checks lint / test / sast / sca to pass.
+#   4. Replace the echo lines in the deploy jobs with your real deployment.
+#
+# Hardening tip: for production use, pin every third-party action to a full
+# commit SHA instead of a version tag (e.g. actions/checkout@<40-char sha>).
+# =============================================================================
+name: CI/CD
 
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+# Least privilege by default; individual jobs ask for more only if needed.
+permissions:
+  contents: read
+
+# Cancel an older run of the same branch/PR when a newer commit arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CI stage: fast feedback (minutes) on every PR and push
+  # ---------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ruff
+      - name: Lint (style and common bugs)
+        run: ruff check .
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+      - name: Unit tests with coverage
+        run: python -m pytest --cov=. --cov-report=term-missing
+
+  sast:
+    name: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install bandit
+      - name: Static analysis (SAST) - fail on medium or higher
+        # Finds eval/exec, shell=True, hard-coded passwords, weak crypto, etc.
+        run: bandit -r . -x ./tests,./.venv --severity-level medium
+
+  sca:
+    name: sca
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install pip-audit
+      - name: Software composition analysis (known CVEs in dependencies)
+        run: pip-audit -r requirements.txt
+
+  # ---------------------------------------------------------------------------
+  # Build stage: only after all CI gates pass, only on main
+  # ---------------------------------------------------------------------------
+  build:
+    name: build
+    needs: [lint, test, sast, sca]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write      # needed for build provenance attestation
+      attestations: write  # needed for build provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package the application
+        run: |
+          mkdir -p dist
+          tar --exclude=.git --exclude=dist -czf "dist/app-${GITHUB_SHA}.tar.gz" .
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest build provenance (signed record of who/what built this)
+        # Free for public repositories; private repos need GitHub Enterprise Cloud.
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: dist/
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # CD stage
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: deploy-staging
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact integrity
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - name: Deploy to staging
+        run: |
+          echo "Deploying app-${GITHUB_SHA}.tar.gz to STAGING"
+          # Replace with your real deployment, e.g.:
+          #   ./scripts/deploy.sh staging dist/app-${GITHUB_SHA}.tar.gz
+      - name: Smoke test
+        run: |
+          echo "Run smoke tests / DAST against staging here"
+          # e.g. curl --fail https://staging.example.com/health
+
+  deploy-production:
+    name: deploy-production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Required reviewers on this environment pause the job until approved.
+    environment:
+      name: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact integrity
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      - name: Deploy to production
+        run: |
+          echo "Deploying app-${GITHUB_SHA}.tar.gz to PRODUCTION"
+          # Replace with your real deployment.
